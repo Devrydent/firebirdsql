@@ -1,3 +1,4 @@
+//go:build !plan9
 // +build !plan9
 
 package firebirdsql
@@ -13,6 +14,7 @@ import (
 )
 
 type Subscription struct {
+	workerDone       func()
 	mu               sync.RWMutex
 	revent           *remoteEvent
 	auxHandle        int32
@@ -22,69 +24,186 @@ type Subscription struct {
 	closed           int32
 	muClose          sync.Mutex
 	closes           []chan error
-	closer           sync.Once
-	chDoneEvent      chan *Subscription
+	owner            *FbEvent
+	noticeWorkers    sync.WaitGroup
+	noticeCancel     chan struct{}
+	noticeCanceled   bool
+	terminalErr      error
 	doneSubscription chan struct{}
 	manager          *eventManager
 	fc               *firebirdsqlConn
-	noNotify         int32
+	scope            *eventScope
+	onDone           func(*Subscription)
 }
 
-func newSubscription(dsn *firebirdDsn, events []string, cb EventHandler, chEvent chan Event, chDoneEvent chan *Subscription) (*Subscription, error) {
-	fc, err := newFirebirdsqlConn(dsn)
+func newSubscription(scope *eventScope, dsn *firebirdDsn, events []string, cb EventHandler, ch chan Event) (*Subscription, error) {
+	revent := newRemoteEvent()
+	if err := revent.queueEvents(events...); err != nil {
+		return nil, err
+	}
+	fc, err := newFirebirdsqlConnWithWire(dsn, scope.wire)
 	if err != nil {
 		return nil, err
 	}
-	newSubscription := &Subscription{
-		fc:               fc,
-		callback:         cb,
-		chEvent:          chEvent,
-		eventCounts:      make(chan Event),
-		doneSubscription: make(chan struct{}),
-		chDoneEvent:      chDoneEvent,
-	}
-	manager, err := newSubscription.getEventManager()
+	s := &Subscription{fc: fc, scope: scope, revent: revent, callback: cb, chEvent: ch, eventCounts: make(chan Event), doneSubscription: make(chan struct{}), noticeCancel: make(chan struct{})}
+	s.manager, err = s.getEventManager()
 	if err != nil {
 		return nil, err
 	}
-	newSubscription.manager = manager
-
-	remoteEvent := newRemoteEvent()
-	if err := remoteEvent.queueEvents(events...); err != nil {
-		return nil, err
+	if err = s.queueEvents(0); err != nil {
+		return nil, fmt.Errorf("initial event registration: %w", err)
 	}
-
-	newSubscription.revent = remoteEvent
-
-	newSubscription.queueEvents(0)
-	chErrManager := manager.wait(remoteEvent, newSubscription.eventCounts)
-	go newSubscription.wait(chErrManager)
-
-	return newSubscription, nil
+	return s, nil
 }
-func (s *Subscription) cancelEvents() error {
-	if atomic.LoadInt32(&s.closed) == 0 {
+func (s *Subscription) start() {
+	go func() { defer s.workerDone(); s.wait(s.manager.wait(s.revent, s.eventCounts)) }()
+}
+func (s *Subscription) wait(chErr <-chan error) {
+	defer func() {
+		s.stop(nil)
+		s.scope.close()
+		<-s.manager.done
+		if s.onDone != nil {
+			s.onDone(s)
+		}
+		close(s.doneSubscription)
+	}()
+	for {
+		select {
+		case <-s.scope.ctx.Done():
+			return
+		case err := <-chErr:
+			s.stop(err)
+			return
+		case event := <-s.eventCounts:
+			if s.callback != nil {
+				go s.callback(event)
+			} else {
+				select {
+				case s.chEvent <- event:
+				case <-s.scope.ctx.Done():
+					return
+				}
+			}
+			if err := s.queueEvents(event.ID); err != nil {
+				s.stop(fmt.Errorf("event rearm: %w", err))
+				return
+			}
+		}
+	}
+}
+
+// stop publishes the terminal state under the same lock used by NotifyClose.
+// Transport cleanup never waits for a consumer to receive a notification.
+func (s *Subscription) stop(err error) bool {
+	s.muClose.Lock()
+	defer s.muClose.Unlock()
+	if s.IsClose() {
+		return false
+	}
+	s.terminalErr = err
+	atomic.StoreInt32(&s.closed, 1)
+	if err != nil {
+		for _, c := range s.closes {
+			s.deliverNoticeLocked(c, err)
+		}
+	}
+	s.closes = nil
+	s.scope.cancel()
+	return true
+}
+
+func (s *Subscription) terminalError() error {
+	s.muClose.Lock()
+	defer s.muClose.Unlock()
+	return s.terminalErr
+}
+
+// deliverNoticeLocked registers every delivery before shutdown can start waiting.
+// The owner also joins deliveries after the subscription leaves its active list.
+func (s *Subscription) deliverNoticeLocked(receiver chan error, err error) {
+	if s.noticeCanceled {
+		return
+	}
+	s.owner.mu.Lock()
+	if s.owner.IsClosed() {
+		s.owner.mu.Unlock()
+		return
+	}
+	s.owner.workers.Add(1)
+	s.noticeWorkers.Add(1)
+	s.owner.mu.Unlock()
+	go func() {
+		defer s.owner.workers.Done()
+		defer s.noticeWorkers.Done()
+		select {
+		case receiver <- err:
+		case <-s.noticeCancel:
+		case <-s.owner.ctx.Done():
+		}
+	}()
+}
+
+// NotifyClose delivers an asynchronous terminal error, including to an unbuffered
+// or temporarily busy receiver. Explicit Subscription/FbEvent Close may cancel
+// pending delivery; normal shutdown sends no error. Receivers must not close
+// registered channels. Late observers see the same terminal error until Close.
+func (s *Subscription) NotifyClose(receiver chan error) {
+	s.muClose.Lock()
+	defer s.muClose.Unlock()
+	if s.IsClose() {
+		if s.terminalErr != nil {
+			s.deliverNoticeLocked(receiver, s.terminalErr)
+		}
+		return
+	}
+	if !s.noticeCanceled {
+		s.closes = append(s.closes, receiver)
+	}
+}
+func (s *Subscription) IsClose() bool { return s == nil || atomic.LoadInt32(&s.closed) == 1 }
+
+func (s *Subscription) cancelNotices() {
+	s.muClose.Lock()
+	if !s.noticeCanceled {
+		s.noticeCanceled = true
+		close(s.noticeCancel)
+	}
+	s.muClose.Unlock()
+}
+func (s *Subscription) finishClose() error {
+	s.cancelNotices()
+	<-s.doneSubscription
+	s.noticeWorkers.Wait()
+	return s.scope.close()
+}
+
+// Unsubscribe preserves the legacy no-op result for an already closed subscription.
+func (s *Subscription) Unsubscribe() error {
+	err := s.Close()
+	if err == ErrFbEventClosed {
 		return nil
 	}
-	id := atomic.LoadInt32(&s.revent.id)
-	s.mu.Lock()
-	s.fc.wp.opCancelEvents(id)
-	_, _, _, err := s.fc.wp.opResponse()
-	s.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	s.revent.cancelEvents()
-	return nil
+	return err
 }
-
+func (s *Subscription) Close() error {
+	s.cancelNotices()
+	first := s.stop(nil)
+	err := s.finishClose()
+	if !first {
+		return ErrFbEventClosed
+	}
+	return err
+}
 func (s *Subscription) queueEvents(eventID int32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := eventID + 1
 	epbData := s.revent.buildEpb()
 
-	s.fc.wp.opQueEvents(s.auxHandle, epbData, id)
+	if err := s.fc.wp.opQueEvents(s.auxHandle, epbData, id); err != nil {
+		return err
+	}
 	rid, _, _, err := s.fc.wp.opResponse()
 	if err != nil {
 		return err
@@ -101,7 +220,7 @@ func (s *Subscription) getEventManager() (*eventManager, error) {
 		return nil, err
 	}
 	address := addr.String() + ":" + strconv.Itoa(port)
-	newManager, err := newEventManager(address, auxHandle)
+	newManager, err := newEventManager(s.scope, address, auxHandle)
 	if err != nil {
 		return nil, err
 	}
@@ -109,57 +228,18 @@ func (s *Subscription) getEventManager() (*eventManager, error) {
 	return newManager, nil
 }
 
-func (s *Subscription) wait(chErrManager <-chan error) {
-	for {
-		select {
-		case event := <-s.eventCounts:
-			s.doEventCounts(event)
-			s.queueEvents(event.ID)
-		case <-s.doneSubscription:
-			return
-		case err := <-chErrManager:
-			s.closeWithError(err)
-		}
-	}
-}
-
-func (s *Subscription) doEventCounts(e Event) {
-	if s.callback != nil {
-		go s.callback(e)
-		return
-	}
-	s.chEvent <- e
-}
-
-func (s *Subscription) Unsubscribe() error {
-	if s.IsClose() {
-		return nil
-	}
-	if s.manager != nil {
-		if err := s.manager.close(); err != nil {
-			return err
-		}
-		s.manager = nil
-	}
-	if err := s.cancelEvents(); err != nil {
-		return err
-	}
-	return s.Close()
-}
-
-func (s *Subscription) unsubscribeNoNotify() error {
-	atomic.StoreInt32(&s.noNotify, 1)
-	return s.Unsubscribe()
-}
-
-// returns network, address, error
 func (s *Subscription) connAuxRequest() (int32, *net.IP, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.fc.wp.opConnectRequest()
+	if err := s.fc.wp.opConnectRequest(); err != nil {
+		return -1, nil, 0, err
+	}
 	auxHandle, _, buf, err := s.fc.wp.opResponse()
 	if err != nil {
 		return -1, nil, 0, err
+	}
+	if len(buf) < 8 {
+		return -1, nil, 0, fmt.Errorf("truncated auxiliary address")
 	}
 	family := bytes_to_int16(buf[0:2])
 	port := binary.BigEndian.Uint16(buf[2:4])
@@ -170,56 +250,4 @@ func (s *Subscription) connAuxRequest() (int32, *net.IP, int, error) {
 	}
 
 	return auxHandle, &ip, int(port), nil
-}
-
-func (s *Subscription) NotifyClose(receiver chan error) {
-	s.muClose.Lock()
-	defer s.muClose.Unlock()
-	s.closes = append(s.closes, receiver)
-}
-
-func (s *Subscription) IsClose() bool {
-	if s == nil {
-		return true
-	}
-	return atomic.LoadInt32(&s.closed) == 1
-}
-
-func (s *Subscription) Close() error {
-	if s.IsClose() {
-		return ErrFbEventClosed
-	}
-	return s.doClose(nil)
-}
-
-func (s *Subscription) closeWithError(err error) error {
-	if s.IsClose() {
-		return ErrFbEventClosed
-	}
-	return s.doClose(err)
-}
-
-func (s *Subscription) doClose(err error) (errResult error) {
-	atomic.StoreInt32(&s.closed, 1)
-	s.closer.Do(func() {
-
-		close(s.doneSubscription)
-
-		s.muClose.Lock()
-		defer s.muClose.Unlock()
-		if err != nil {
-			for _, c := range s.closes {
-				c <- err
-			}
-		}
-
-		s.mu.RLock()
-		errResult = s.fc.Close()
-		s.mu.RUnlock()
-
-		if atomic.LoadInt32(&s.noNotify) == 0 {
-			s.chDoneEvent <- s
-		}
-	})
-	return
 }

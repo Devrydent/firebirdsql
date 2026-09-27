@@ -433,23 +433,32 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 	p.debugPrint("_parse_connect_response")
 
 	b, err := p.recvPackets(4)
+	if err != nil {
+		return err
+	}
 	opcode := bytes_to_bint32(b)
 
 	for opcode == op_dummy {
-		b, _ = p.recvPackets(4)
+		b, err = p.recvPackets(4)
+		if err != nil {
+			return err
+		}
 		opcode = bytes_to_bint32(b)
 	}
 
 	if opcode == op_reject {
 		err = errors.New("_parse_connect_response() op_reject")
-		return
+		return err
 	}
 	if opcode == op_response {
 		_, _, _, err = p._parse_op_response() // error occured
-		return
+		return err
 	}
 
-	b, _ = p.recvPackets(12)
+	b, err = p.recvPackets(12)
+	if err != nil {
+		return err
+	}
 	p.protocolVersion = int32(b[3])
 	p.acceptArchitecture = bytes_to_bint32(b[4:8])
 	p.acceptType = bytes_to_bint32(b[8:12])
@@ -457,22 +466,47 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 	if opcode == op_cond_accept || opcode == op_accept_data {
 		var readLength, ln int
 
-		b, _ := p.recvPackets(4)
-		ln = int(bytes_to_bint32(b))
-		data, _ := p.recvPacketsAlignment(ln)
+		b, err := p.recvPackets(4)
 
-		b, _ = p.recvPackets(4)
+		if err != nil {
+			return err
+		}
 		ln = int(bytes_to_bint32(b))
-		pluginName, _ := p.recvPacketsAlignment(ln)
+		data, err := p.recvPacketsAlignment(ln)
+		if err != nil {
+			return err
+		}
+
+		b, err = p.recvPackets(4)
+
+		if err != nil {
+			return err
+		}
+		ln = int(bytes_to_bint32(b))
+		pluginName, err := p.recvPacketsAlignment(ln)
+		if err != nil {
+			return err
+		}
 		p.pluginName = bytes_to_str(pluginName)
 
-		b, _ = p.recvPackets(4)
+		b, err = p.recvPackets(4)
+
+		if err != nil {
+			return err
+		}
 		isAuthenticated := bytes_to_bint32(b)
 		readLength += 4
 
-		b, _ = p.recvPackets(4)
+		b, err = p.recvPackets(4)
+
+		if err != nil {
+			return err
+		}
 		ln = int(bytes_to_bint32(b))
-		_, _ = p.recvPacketsAlignment(ln) // keys
+		_, err = p.recvPacketsAlignment(ln) // keys
+		if err != nil {
+			return err
+		}
 
 		var authData []byte
 		var sessionKey []byte
@@ -483,26 +517,57 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 
 				if len(data) == 0 {
 					p.opContAuth(bigIntToBytes(clientPublic), p.pluginName, PLUGIN_LIST, "")
-					b, _ := p.recvPackets(4)
+					b, err := p.recvPackets(4)
+					if err != nil {
+						return err
+					}
 					if DEBUG_SRP && bytes_to_bint32(b) == op_cont_auth {
 						panic("auth error")
 					}
 
-					b, _ = p.recvPackets(4)
-					ln = int(bytes_to_bint32(b))
-					data, _ = p.recvPacketsAlignment(ln)
+					b, err = p.recvPackets(4)
 
-					b, _ = p.recvPackets(4)
+					if err != nil {
+						return err
+					}
 					ln = int(bytes_to_bint32(b))
-					_, _ = p.recvPacketsAlignment(ln) // pluginName
+					data, err = p.recvPacketsAlignment(ln)
+					if err != nil {
+						return err
+					}
 
-					b, _ = p.recvPackets(4)
-					ln = int(bytes_to_bint32(b))
-					_, _ = p.recvPacketsAlignment(ln) // pluginList
+					b, err = p.recvPackets(4)
 
-					b, _ = p.recvPackets(4)
+					if err != nil {
+						return err
+					}
 					ln = int(bytes_to_bint32(b))
-					_, _ = p.recvPacketsAlignment(ln) // keys
+					_, err = p.recvPacketsAlignment(ln) // pluginName
+					if err != nil {
+						return err
+					}
+
+					b, err = p.recvPackets(4)
+
+					if err != nil {
+						return err
+					}
+					ln = int(bytes_to_bint32(b))
+					_, err = p.recvPacketsAlignment(ln) // pluginList
+					if err != nil {
+						return err
+					}
+
+					b, err = p.recvPackets(4)
+
+					if err != nil {
+						return err
+					}
+					ln = int(bytes_to_bint32(b))
+					_, err = p.recvPacketsAlignment(ln) // keys
+					if err != nil {
+						return err
+					}
 				}
 
 				ln = int(bytes_to_int16(data[:2]))
@@ -517,7 +582,7 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 				authData = bytes.NewBufferString(crypt.Crypt(password, "9z")[2:]).Bytes()
 			} else {
 				err = errors.New("_parse_connect_response() Unauthorized")
-				return
+				return err
 			}
 		}
 
@@ -529,7 +594,7 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 			var buf []byte
 			_, _, buf, err = p.opResponse()
 			if err != nil {
-				return
+				return err
 			}
 			encrypt_plugin, nonce = p._guess_wire_crypt(buf)
 		}
@@ -542,7 +607,7 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 			p.conn.setCryptKey(encrypt_plugin, sessionKey, nonce)
 			_, _, _, err = p.opResponse()
 			if err != nil {
-				return
+				return err
 			}
 		} else {
 			p.authData = authData // use later opAttach and opCreate
@@ -551,11 +616,11 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 	} else {
 		if opcode != op_accept {
 			err = errors.New("_parse_connect_response() protocol error")
-			return
+			return err
 		}
 	}
 
-	return
+	return err
 }
 
 func (p *wireProtocol) _parse_select_items(buf []byte, xsqlda []xSQLVAR) (int, error) {
@@ -1431,16 +1496,20 @@ func (p *wireProtocol) debugPrint(s string, a ...interface{}) {
 	//fmt.Printf("[%x] %s\n", uintptr(unsafe.Pointer(p)), s)
 }
 
-func (p *wireProtocol) opConnectRequest() {
+func (p *wireProtocol) opConnectRequest() error {
 	p.debugPrint("opConnectRequest()")
 	p.packInt(op_connect_request)
 	p.packInt(p_req_async)
 	p.packInt(p.dbHandle)
 	p.packInt(partner_identification)
-	p.sendPackets()
+	_, err := p.sendPackets()
+	if err == nil {
+		err = p.conn.Flush()
+	}
+	return err
 }
 
-func (p *wireProtocol) opQueEvents(auxHandle int32, epb []byte, eventId int32) {
+func (p *wireProtocol) opQueEvents(auxHandle int32, epb []byte, eventId int32) error {
 	p.debugPrint("opQueEvents():%d %d", auxHandle, eventId)
 	p.packInt(op_que_events)
 	p.packInt(auxHandle)
@@ -1448,7 +1517,11 @@ func (p *wireProtocol) opQueEvents(auxHandle int32, epb []byte, eventId int32) {
 	p.packInt(address_of_ast_routine)
 	p.packInt(argument_to_ast_routine)
 	p.packInt(eventId)
-	p.sendPackets()
+	_, err := p.sendPackets()
+	if err == nil {
+		err = p.conn.Flush()
+	}
+	return err
 }
 
 func (p *wireProtocol) opCancelEvents(eventID int32) {

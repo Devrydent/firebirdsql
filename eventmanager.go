@@ -1,3 +1,4 @@
+//go:build !plan9
 // +build !plan9
 
 /*******************************************************************************
@@ -26,6 +27,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 package firebirdsql
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -33,15 +35,18 @@ type eventManager struct {
 	wp         *wireProtocol
 	handle     int32
 	destructor sync.Once
+	scope      *eventScope
+	done       chan struct{}
 }
 
-func newEventManager(address string, auxHandle int32) (*eventManager, error) {
-	wp, err := newWireProtocol(address, "", "UTF8")
+func newEventManager(scope *eventScope, address string, auxHandle int32) (*eventManager, error) {
+	wp, err := scope.wire(address, "", "UTF8")
 	if err != nil {
 		return nil, err
 	}
 	newManager := &eventManager{
-		wp:     wp,
+		wp:    wp,
+		scope: scope, done: make(chan struct{}),
 		handle: auxHandle,
 	}
 	return newManager, nil
@@ -50,6 +55,7 @@ func newEventManager(address string, auxHandle int32) (*eventManager, error) {
 func (e *eventManager) wait(event *remoteEvent, eventCounts chan<- Event) <-chan error {
 	chErr := make(chan error, 1)
 	go func() {
+		defer close(e.done)
 		for {
 			data, err := e.wp.recvPackets(4)
 			if err != nil {
@@ -60,16 +66,42 @@ func (e *eventManager) wait(event *remoteEvent, eventCounts chan<- Event) <-chan
 			op := bytes_to_bint32(data)
 			switch op {
 			case op_event:
-				e.wp.recvPackets(4) //handle
-				b, _ := e.wp.recvPackets(4)
+				if _, err = e.wp.recvPackets(4); err != nil {
+					chErr <- err
+					return
+				}
+				b, err := e.wp.recvPackets(4)
+				if err != nil {
+					chErr <- err
+					return
+				}
 				szBuf := bytes_to_bint32(b)
-				buffer, _ := e.wp.recvPacketsAlignment(int(szBuf))
-				e.wp.recvPackets(8) //ast
-				b, _ = e.wp.recvPackets(4)
+				if szBuf < 0 || int(szBuf) > maxEpbLength {
+					chErr <- fmt.Errorf("event buffer size out of range: %d", szBuf)
+					return
+				}
+				buffer, err := e.wp.recvPacketsAlignment(int(szBuf))
+				if err != nil {
+					chErr <- err
+					return
+				}
+				if _, err = e.wp.recvPackets(8); err != nil {
+					chErr <- err
+					return
+				}
+				b, err = e.wp.recvPackets(4)
+				if err != nil {
+					chErr <- err
+					return
+				}
 				eventId := bytes_to_bint32(b)
 				e.wp.debugPrint("op_event:%v: event id: %v", buffer, eventId)
 				for _, count := range event.getEventCounts(buffer) {
-					eventCounts <- count
+					select {
+					case eventCounts <- count:
+					case <-e.scope.ctx.Done():
+						return
+					}
 				}
 			default:
 				e.wp.debugPrint("unknown operation:%v:%v", op, data)

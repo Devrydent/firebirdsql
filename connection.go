@@ -132,8 +132,12 @@ func (fc *firebirdsqlConn) Query(query string, args []driver.Value) (rows driver
 }
 
 func newFirebirdsqlConn(dsn *firebirdDsn) (fc *firebirdsqlConn, err error) {
+	return newFirebirdsqlConnWithWire(dsn, newWireProtocol)
+}
 
-	wp, err := newWireProtocol(dsn.addr, dsn.options["timezone"], dsn.options["charset"])
+func newFirebirdsqlConnWithWire(dsn *firebirdDsn, wire func(string, string, string) (*wireProtocol, error)) (fc *firebirdsqlConn, err error) {
+
+	wp, err := wire(dsn.addr, dsn.options["timezone"], dsn.options["charset"])
 	if err != nil {
 		return
 	}
